@@ -26,7 +26,6 @@ from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import (
     MegatronPretrainingSampler,
 )
 from nemo.collections.nlp.data.language_modeling.megatron.gpt_dataset import build_train_valid_test_datasets
-from nemo.collections.nlp.models.language_modeling.megatron.gpt_model import GPTModel
 from nemo.collections.nlp.models.language_modeling.megatron_base_model import MegatronBaseModel
 from nemo.collections.nlp.modules.common.megatron.module import Float16Module
 from nemo.collections.nlp.modules.common.megatron.utils import (
@@ -51,6 +50,9 @@ from nemo.collections.nlp.parts.nlp_overrides import GradScaler
 from nemo.collections.nlp.parts.utils_funcs import get_last_rank
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
+
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.models.gpt.gpt_model import GPTModel
 
 try:
     from apex.transformer import parallel_state
@@ -156,53 +158,58 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         return self._inference_config
 
     def model_provider_func(self, pre_process, post_process):
-        """Model depends on pipeline paralellism."""
-        model = GPTModel(
-            vocab_size=self.padded_vocab_size,
-            hidden_size=self.cfg.hidden_size,
-            max_position_embeddings=self.cfg.max_position_embeddings,
+        """Dynamically build the model depending on the pipeline stage."""
+
+        if self.cfg.get('kv_channels', None) is None:
+            assert (
+                self.cfg.hidden_size % self.cfg.num_attention_heads == 0
+            ), 'hidden_size must be divisible by num_attention_heads if kv_channels is None'
+            kv_channels = self.cfg.hidden_size // self.cfg.num_attention_heads
+
+        # nemo megatron only suppots amp o2 for bfloat16 currently
+        if self.megatron_amp_o2:
+            params_dtype = torch.bfloat16
+            bf16 = True
+        else:
+            params_dtype = torch.float32
+            bf16 = False
+
+        transformer_config = TransformerConfig(
             num_layers=self.cfg.num_layers,
+            hidden_size=self.cfg.hidden_size,
             num_attention_heads=self.cfg.num_attention_heads,
-            apply_query_key_layer_scaling=self.cfg.get('apply_query_key_layer_scaling', True),
-            kv_channels=self.cfg.get('kv_channels', None),
             ffn_hidden_size=self.cfg.ffn_hidden_size,
-            num_tokentypes=0,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process,
-            init_method_std=self.cfg.get('init_method_std', 0.02),
-            use_scaled_init_method=self.cfg.get('use_scaled_init_method', True),
-            fp16_lm_cross_entropy=self.cfg.get('fp16_lm_cross_entropy', False),
-            use_cpu_initialization=self.cfg.get('use_cpu_initialization', False),
+            kv_channels=kv_channels,
             hidden_dropout=self.cfg.get('hidden_dropout', 0.1),
             attention_dropout=self.cfg.get('attention_dropout', 0.1),
-            precision=self.cfg.get('precision', 16),
             fp32_residual_connection=self.cfg.get('fp32_residual_connection', False),
-            activations_checkpoint_granularity=self.cfg.get('activations_checkpoint_granularity', None),
-            activations_checkpoint_method=self.cfg.get('activations_checkpoint_method', None),
-            activations_checkpoint_num_layers=self.cfg.get('activations_checkpoint_num_layers', 1),
-            activations_checkpoint_layers_per_pipeline=self.cfg.get(
-                'activations_checkpoint_layers_per_pipeline', None
-            ),
-            normalization=self.cfg.get('normalization', 'layernorm'),
             layernorm_epsilon=self.cfg.get('layernorm_epsilon', 1e-5),
-            onnx_safe=self.cfg.get('onnx_safe', False),
-            bias_activation_fusion=self.cfg.get('bias_activation_fusion', True),
-            bias_dropout_add_fusion=self.cfg.get('bias_dropout_add_fusion', True),
-            masked_softmax_fusion=self.cfg.get('masked_softmax_fusion', True),
+            tensor_model_parallel_size=self.cfg.get('tensor_model_parallel_size', 1),
+            pipeline_model_parallel_size=self.cfg.get('pipeline_model_parallel_size', 1),
+            virtual_pipeline_model_parallel_size=self.cfg.get('virtual_pipeline_model_parallel_size', None),
+            sequence_parallel_enabled=self.cfg.get('sequence_parallel'),
+            init_method_std=self.cfg.get('init_method_std', 0.02),
+            use_cpu_initialization=self.cfg.get('use_cpu_initialization', False),
+            params_dtype=params_dtype,
+            bf16=bf16,
+            apply_query_key_layer_scaling=self.cfg.get('apply_query_key_layer_scaling', True),
             gradient_accumulation_fusion=self.cfg.get('gradient_accumulation_fusion', False),
+            bias_gelu_fusion=self.cfg.get('bias_activation_fusion', False),
+            masked_softmax_fusion=self.cfg.get('masked_softmax_fusion', False),
             persist_layer_norm=self.cfg.get('persist_layer_norm', False),
-            sequence_parallel=self.cfg.get('sequence_parallel', False),
-            transformer_engine=self.cfg.get('transformer_engine', False),
-            fp8=self.cfg.get('fp8', False),
-            fp8_e4m3=self.cfg.get('fp8_e4m3', False),
-            fp8_hybrid=self.cfg.get('fp8_hybrid', False),
-            fp8_margin=self.cfg.get('fp8_margin', 0),
-            fp8_interval=self.cfg.get('fp8_interval', 1),
-            fp8_amax_history_len=self.cfg.get('fp8_amax_history_len', 1),
-            fp8_amax_compute_algo=self.cfg.get('fp8_amax_compute_algo', 'most_recent'),
-            reduce_amax=self.cfg.get('reduce_amax', True),
-            use_emha=self.cfg.get('use_emha', False),
+            bias_dropout_fusion=self.cfg.get('bias_dropout_add_fusion', True),
+            recompute_granularity=self.cfg.get('activations_checkpoint_granularity', None),
+            recompute_method=self.cfg.get('activations_checkpoint_method', None),
+            recompute_num_layers=self.cfg.get('activations_checkpoint_num_layers', 1),
+        )
+        model = GPTModel(
+            config=transformer_config,
+            vocab_size=self.padded_vocab_size,
+            max_sequence_length=self.cfg.get('encoder_seq_length', 512),
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=self.cfg.get('fp16_lm_cross_entropy', False),
+            parallel_output=True,
         )
 
         return model
