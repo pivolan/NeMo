@@ -904,6 +904,7 @@ def configure_checkpointing(
     preemption_callback = PreemptionCallback(torch.device('cuda'), checkpoint_callback)
     trainer.callbacks.append(preemption_callback)
 
+
 def check_slurm(trainer):
     try:
         return trainer.accelerator_connector.is_slurm_managing_tasks

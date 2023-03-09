@@ -1,12 +1,14 @@
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback, ModelCheckpoint
-from nemo.collections.common.callbacks.nemomodelcheckpoint import NeMoModelCheckpoint
-import signal  
-import torch
+import signal
 import sys
 
-class PreemptionCallback(Callback):
+import pytorch_lightning as pl
+import torch
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 
+from nemo.collections.common.callbacks.nemomodelcheckpoint import NeMoModelCheckpoint
+
+
+class PreemptionCallback(Callback):
     def __init__(self, device, checkpoint_callback, sig=signal.SIGTERM):
         self.sig = sig
         self.device = device
